@@ -1,0 +1,372 @@
+kind: playground
+name: my-k3s-89c9799c
+base: k3s
+title: Tailscale Homelab Access
+description: A multi-node K3s cluster to demo connecting and troubleshooting a homelab remotely via tailscale. All username/passwords are admin/admin123
+cover: /content/files/playgrounds/my-k3s-89c9799c/__static__/revisednetworkoverview.png
+categories:
+    - cloud
+    - networking
+    - kubernetes
+markdown: |-
+    This is a demo of how you can use tailscale to log in and administer your homelab (or in this case, remotelab) from anywhere.
+
+    It's a k3s cluster spread across 4 nodes:
+    - control plane (cplane-01)
+    - worker node 1 (node-01)
+    - worker node 2 (node-02)
+    - central server (dev-machine)
+
+    ![k3s cluster components](__static__/K3scluster.png)
+
+    The accompanying [blog](https://dev.to/lpmi13/remote-homelab-admin-with-tailscale-1jp2) walks through a simulated problem in the homelab, and how you could triage it and fix the issue, all from your phone, using tailscale to connect over private encrypted tunnels.
+
+    And here's a [full video demo](https://youtu.be/VlHK9XdbQtY)
+
+    ## The scene
+
+    The user starts out watching a slideshow of cats from the self-hosted jellyfin server. Suddenly, the cats are having issues. The user can see in Grafana (also from the phone) that the node's disk is full. The user can then ssh into the node and delete all the extra logs. After rebooting the k3s agent, the cats are back!
+
+    ...and all without leaving the comfort of your mobile device via the magic of Tailscale.
+playground:
+    networks:
+        - name: local
+          subnet: 172.16.0.0/24
+    machines:
+        - name: dev-machine
+          users:
+            - name: root
+            - name: laborant
+              default: true
+          drives:
+            - source: k3s-dev-machine
+              mount: /
+              size: 10GiB
+          network:
+            interfaces:
+                - address: 172.16.0.5/24
+                  network: local
+          resources:
+            cpuCount: 2
+            ramSize: 4G
+        - name: cplane-01
+          users:
+            - name: root
+            - name: laborant
+              default: true
+          drives:
+            - source: k3s-cplane
+              mount: /
+              size: 10GiB
+          network:
+            interfaces:
+                - address: 172.16.0.2/24
+                  network: local
+          resources:
+            cpuCount: 2
+            ramSize: 4G
+        - name: node-01
+          users:
+            - name: root
+            - name: laborant
+              default: true
+          drives:
+            - source: k3s-node
+              mount: /
+              size: 10GiB
+          network:
+            interfaces:
+                - address: 172.16.0.3/24
+                  network: local
+          resources:
+            cpuCount: 2
+            ramSize: 4G
+        - name: node-02
+          users:
+            - name: root
+            - name: laborant
+              default: true
+          drives:
+            - source: k3s-node
+              mount: /
+              size: 10GiB
+          network:
+            interfaces:
+                - address: 172.16.0.4/24
+                  network: local
+          resources:
+            cpuCount: 2
+            ramSize: 4GB
+          startupFiles:
+            - path: /opt/generate_logs.sh
+              content: "#!/bin/bash\n\n# Configuration\nLOG_DIR=\"/var/log/fake_logs\"  # Directory to store generated logs\nLOG_PREFIX=\"fill_log\"         # Prefix for log filenames\nLOG_SIZE=\"1G\"                # Size of each log file (e.g., 10M, 100M, 1G)\n\n# Create log directory if it doesn't exist\n\necho \"Starting to fill drive with logs in $LOG_DIR...\"\necho \"Each log file will be $LOG_SIZE in size.\"\necho \"Press Ctrl+C to stop...\"\n\nwhile true; do\n    # Get current Unix epoch timestamp\n    TIMESTAMP=$(date +%s)\n    \n    LOG_FILE=\"${LOG_DIR}/${LOG_PREFIX}_${TIMESTAMP}.log\"\n    \n    # Use dd to create a log file filled with random data\n    dd if=/dev/urandom of=\"$LOG_FILE\" bs=\"$LOG_SIZE\" count=1 2>/dev/nul\n    \n    echo \"Created: $LOG_FILE\"\ndone\n\necho \"Finished creating log files.\""
+              mode: "655"
+              owner: laborant:laborant
+              append: false
+    tabs:
+        - id: terminal-dev-machine
+          kind: terminal
+          name: dev-machine
+          machine: dev-machine
+        - id: terminal-cplane-01
+          kind: terminal
+          name: cplane-01
+          machine: cplane-01
+        - id: terminal-node-01
+          kind: terminal
+          name: node-01
+          machine: node-01
+        - id: terminal-node-02
+          kind: terminal
+          name: node-02
+          machine: node-02
+    initTasks:
+        init_dev_machine_configure_monitoring:
+            name: init_dev_machine_configure_monitoring
+            machine: dev-machine
+            init: true
+            user: root
+            timeout_seconds: 300
+            needs:
+                - init_dev_machine_configure_node_exporter
+            run: "#!/bin/bash\n\ncat << 'EOF' > monitoring.yaml\n# Save as monitoring.yaml\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: prometheus-config\ndata:\n  prometheus.yml: |\n    global:\n      scrape_interval: 15s\n      evaluation_interval: 15s\n      scrape_timeout: 10s\n    \n    scrape_configs:\n      - job_name: 'node-exporter'\n        kubernetes_sd_configs:\n          - role: node\n        scheme: http\n        metrics_path: /metrics\n        relabel_configs:\n          - source_labels: [__address__]\n            regex: '(.*):10250'\n            replacement: '${1}:9100'\n            target_label: __address__\n          - action: labelmap\n            regex: __meta_kubernetes_node_label_(.+)\n          - source_labels: [__meta_kubernetes_node_name]\n            target_label: node\n      - job_name: 'kube-state-metrics'\n        static_configs:\n          - targets: ['kube-state-metrics.kube-system.svc.cluster.local:8080']\n        scrape_interval: 30s\n\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: prometheus\nspec:\n  replicas: 1\n  selector:\n    matchLabels:\n      app: prometheus\n  template:\n    metadata:\n      labels:\n        app: prometheus\n    spec:\n      serviceAccountName: prometheus\n      nodeSelector:\n        kubernetes.io/hostname: node-01\n      containers:\n      - name: prometheus\n        image: prom/prometheus:latest\n        ports:\n        - containerPort: 9090\n        volumeMounts:\n        - name: config\n          mountPath: /etc/prometheus\n        args:\n          - '--config.file=/etc/prometheus/prometheus.yml'\n          - '--storage.tsdb.path=/prometheus'\n          - '--web.console.libraries=/etc/prometheus/console_libraries'\n          - '--web.console.templates=/etc/prometheus/consoles'\n      volumes:\n      - name: config\n        configMap:\n          name: prometheus-config\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: prometheus-service\nspec:\n  selector:\n    app: prometheus\n  ports:\n  - port: 9090\n    nodePort: 30090\n  type: NodePort\nEOF\n\nkubectl apply -f monitoring.yaml\n\n# the get the default kube-state-metrics\n\ngit clone https://github.com/kubernetes/kube-state-metrics.git\nkubectl apply -f kube-state-metrics/examples/standard/cluster-role-binding.yaml\nkubectl apply -f kube-state-metrics/examples/standard/cluster-role.yaml\nkubectl apply -f kube-state-metrics/examples/standard/deployment.yaml\nkubectl apply -f kube-state-metrics/examples/standard/service-account.yaml\nkubectl apply -f kube-state-metrics/examples/standard/service.yaml"
+        init_dev_machine_configure_node_exporter:
+            name: init_dev_machine_configure_node_exporter
+            machine: dev-machine
+            init: true
+            user: root
+            timeout_seconds: 300
+            run: |-
+                #!/bin/bash
+
+                cat << 'EOF' > node_exporter.yaml
+                # Save as node-exporter.yaml
+                apiVersion: apps/v1
+                kind: DaemonSet
+                metadata:
+                  name: node-exporter
+                spec:
+                  selector:
+                    matchLabels:
+                      app: node-exporter
+                  template:
+                    metadata:
+                      labels:
+                        app: node-exporter
+                    spec:
+                      containers:
+                      - name: node-exporter
+                        image: prom/node-exporter:latest
+                        ports:
+                        - containerPort: 9100
+                        volumeMounts:
+                        - name: proc
+                          mountPath: /host/proc
+                          readOnly: true
+                        - name: sys
+                          mountPath: /host/sys
+                          readOnly: true
+                        - name: root
+                          mountPath: /rootfs
+                          readOnly: true
+                        args:
+                          - '--path.procfs=/host/proc'
+                          - '--path.sysfs=/host/sys'
+                          - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)'
+                      volumes:
+                      - name: proc
+                        hostPath:
+                          path: /proc
+                      - name: sys
+                        hostPath:
+                          path: /sys
+                      - name: root
+                        hostPath:
+                          path: /
+                      hostNetwork: true
+                      hostPID: true
+                EOF
+
+                kubectl apply -f node_exporter.yaml
+        init_dev_machine_configure_rbac:
+            name: init_dev_machine_configure_rbac
+            machine: dev-machine
+            init: true
+            user: root
+            timeout_seconds: 300
+            needs:
+                - init_dev_machine_configure_node_exporter
+                - init_dev_machine_configure_monitoring
+            run: |-
+                #!/bin/bash
+                cat << 'EOF' > rbac.yaml
+                apiVersion: v1
+                kind: ServiceAccount
+                metadata:
+                  name: prometheus
+                ---
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRole
+                metadata:
+                  name: prometheus
+                rules:
+                - apiGroups: [""]
+                  resources:
+                  - nodes
+                  - nodes/metrics
+                  - services
+                  - endpoints
+                  - pods
+                  verbs: ["get", "list", "watch"]
+                - apiGroups: [""]
+                  resources:
+                  - configmaps
+                  verbs: ["get"]
+                - apiGroups: ["networking.k8s.io"]
+                  resources:
+                  - ingresses
+                  verbs: ["get", "list", "watch"]
+                - nonResourceURLs: ["/metrics"]
+                  verbs: ["get"]
+                ---
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRoleBinding
+                metadata:
+                  name: prometheus
+                roleRef:
+                  apiGroup: rbac.authorization.k8s.io
+                  kind: ClusterRole
+                  name: prometheus
+                subjects:
+                - kind: ServiceAccount
+                  name: prometheus
+                  namespace: default
+                EOF
+
+                kubectl apply -f rbac.yaml
+        init_dev_machine_configure_ssh_access:
+            name: init_dev_machine_configure_ssh_access
+            machine: dev-machine
+            init: true
+            user: root
+            timeout_seconds: 300
+            needs:
+                - init_dev_machine_deploy_remotelab
+            run: "#!/bin/bash\n\n# Check if phoneuser already exists\nif id \"phoneuser\" &>/dev/null; then\n    echo \"User 'phoneuser' already exists. Skipping user creation.\"\nelse\n    echo \"Creating user 'phoneuser'...\"\n    useradd -m -s /bin/bash phoneuser\n    \n    # Add to sudo group if you want admin access (optional)\n    usermod -aG sudo phoneuser\n    echo \"User 'phoneuser' created successfully.\"\nfi\n\n# Ensure .ssh directory exists\nmkdir -p /home/phoneuser/.ssh\n\n# Set up SSH key\necho \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMbXUaRWWzIgKXP/asJxzJLuk4pYIvxm1Pl4mWyBN3Ru\" | sudo tee /home/phoneuser/.ssh/authorized_keys\nchown phoneuser:phoneuser /home/phoneuser/.ssh/authorized_keys\nchmod 600 /home/phoneuser/.ssh/authorized_keys\n\n# Set up Kubernetes access\n# Ensure .kube directory exists\nmkdir -p /home/phoneuser/.kube\n\n# Copy kubernetes config if source exists\nif [ -f /home/laborant/.kube/config ]; then\n    cp /home/laborant/.kube/config /home/phoneuser/.kube/config\n    chown -R phoneuser:phoneuser /home/phoneuser/.kube\n    echo \"Kubernetes configuration copied successfully.\"\nelse\n    echo \"Warning: /home/laborant/.kube/config not found. Skipping Kubernetes setup.\"\nfi\n\necho \"Script completed successfully.\"\n"
+        init_dev_machine_deploy_remotelab:
+            name: init_dev_machine_deploy_remotelab
+            machine: dev-machine
+            init: true
+            user: root
+            timeout_seconds: 300
+            needs:
+                - init_dev_machine_configure_node_exporter
+                - init_dev_machine_configure_monitoring
+            run: "#!/bin/bash\n\ncat << 'EOF' > remotelab_deployment.yaml\n---\n# Home Assistant ConfigMap\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: home-assistant-configmap\n  namespace: default\ndata:\n  configuration.yaml: |\n    http:\n      use_x_forwarded_for: true\n      trusted_proxies:\n        - 10.42.0.0/16     # k3s Flannel CNI range (default)\n        - 100.64.0.0/10    # Tailscale's entire IP range\n        - fd7a:115c:a1e0::/48  # Tailscale IPv6 range\n        - 127.0.0.1\n        - ::1\n---\n# Home Assistant PVC\napiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: home-assistant-config\n  namespace: default\nspec:\n  accessModes:\n    - ReadWriteOnce\n  resources:\n    requests:\n      storage: 5Gi\n  storageClassName: local-path\n---\n# Home Assistant Deployment\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: home-assistant\n  namespace: default\nspec:\n  replicas: 1\n  selector:\n    matchLabels:\n      app: home-assistant\n  template:\n    metadata:\n      labels:\n        app: home-assistant\n    spec:\n      nodeSelector:\n        kubernetes.io/hostname: node-01\n      containers:\n      - name: home-assistant\n        image: ghcr.io/home-assistant/home-assistant:stable\n        ports:\n        - containerPort: 8123\n        env:\n        - name: TZ\n          value: \"Europe/London\"\n        volumeMounts:\n        - name: config\n          mountPath: /config\n        - name: configmap\n          mountPath: /config/configuration.yaml\n          subPath: configuration.yaml\n        securityContext:\n          runAsUser: 0\n          runAsGroup: 0\n        resources:\n          requests:\n            memory: \"512Mi\"\n            cpu: \"250m\"\n          limits:\n            memory: \"1Gi\"\n            cpu: \"500m\"\n      volumes:\n      - name: config\n        persistentVolumeClaim:\n          claimName: home-assistant-config\n      - name: configmap\n        configMap:\n          name: home-assistant-configmap\n---\n# Home Assistant Service\napiVersion: v1\nkind: Service\nmetadata:\n  name: home-assistant-service\n  namespace: default\nspec:\n  selector:\n    app: home-assistant\n  ports:\n  - port: 8123\n    targetPort: 8123\n    nodePort: 30123\n  type: NodePort\n---\n# Jellyfin Media PVC\napiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: jellyfin-media\n  namespace: default\nspec:\n  accessModes:\n    - ReadWriteOnce\n  resources:\n    requests:\n      storage: 20Gi\n  storageClassName: local-path\n---\n# Jellyfin Deployment\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: jellyfin\n  namespace: default\nspec:\n  replicas: 1\n  selector:\n    matchLabels:\n      app: jellyfin\n  template:\n    metadata:\n      labels:\n        app: jellyfin\n    spec:\n      nodeSelector:\n        kubernetes.io/hostname: node-02\n      containers:\n      - name: jellyfin\n        image: ghcr.io/jellyfin/jellyfin:10.10.7-amd64.20250405-191553\n        ports:\n        - containerPort: 8096\n        env:\n        - name: PUID\n          value: \"1000\"\n        - name: PGID\n          value: \"1000\"\n        - name: TZ\n          value: \"Europe/London\"\n        volumeMounts:\n        - name: config\n          mountPath: /config\n        - name: media\n          mountPath: /media\n        - name: host-photos\n          mountPath: /photos\n          readOnly: true\n        resources:\n          requests:\n            memory: \"1Gi\"\n            cpu: \"500m\"\n          limits:\n            memory: \"2Gi\"\n            cpu: \"1000m\"\n      volumes:\n      - name: config\n        hostPath:\n          path: /jellyfin-config\n          type: Directory\n      - name: media\n        persistentVolumeClaim:\n          claimName: jellyfin-media\n      - name: host-photos\n        hostPath:\n          path: /cats\n          type: Directory\n---\n# Jellyfin Service\napiVersion: v1\nkind: Service\nmetadata:\n  name: jellyfin-service\n  namespace: default\nspec:\n  selector:\n    app: jellyfin\n  ports:\n  - port: 8096\n    targetPort: 8096\n    nodePort: 30096\n  type: NodePort\n---\n# Grafana Datasources ConfigMap\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: grafana-datasources\n  namespace: default\ndata:\n  datasources.yaml: |\n    apiVersion: 1\n    datasources:\n      - name: Prometheus\n        type: prometheus\n        access: proxy\n        url: http://prometheus-service:9090\n        isDefault: true\n        editable: false\n---\n# Grafana Dashboards Provider ConfigMap\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: grafana-dashboards-config\n  namespace: default\ndata:\n  dashboards.yaml: |\n    apiVersion: 1\n    providers:\n      - name: default\n        type: file\n        disableDeletion: false\n        updateIntervalSeconds: 30\n        allowUiUpdates: true\n        options:\n          path: /var/lib/grafana/dashboards\n---\n# Grafana Dashboard ConfigMap\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: grafana-dashboard-homelab\n  namespace: default\ndata:\n  homelab-monitoring.json: |\n    {\n      \"id\": null,\n      \"uid\": \"remotelab-main\",\n      \"title\": \"Remotelab Monitoring\",\n      \"tags\": [\"remotelab\", \"k3s\"],\n      \"timezone\": \"Europe/London\",\n      \"refresh\": \"5s\",\n      \"time\": {\n        \"from\": \"now-1h\",\n        \"to\": \"now\"\n      },\n      \"panels\": [\n        {\n          \"id\": 1,\n          \"title\": \"Node Status Overview\",\n          \"type\": \"stat\",\n          \"targets\": [\n            {\n              \"expr\": \"up{job=\\\"node-exporter\\\"}\",\n              \"legendFormat\": \"{{instance}}\",\n              \"refId\": \"A\"\n            }\n          ],\n          \"fieldConfig\": {\n            \"defaults\": {\n              \"color\": {\n                \"mode\": \"thresholds\"\n              },\n              \"thresholds\": {\n                \"steps\": [\n                  {\"color\": \"red\", \"value\": 0},\n                  {\"color\": \"green\", \"value\": 1}\n                ]\n              },\n              \"mappings\": [\n                {\"options\": {\"0\": {\"text\": \"DOWN\"}}, \"type\": \"value\"},\n                {\"options\": {\"1\": {\"text\": \"UP\"}}, \"type\": \"value\"}\n              ]\n            }\n          },\n          \"gridPos\": {\"h\": 4, \"w\": 12, \"x\": 0, \"y\": 0}\n        },\n        {\n          \"id\": 2,\n          \"title\": \"Application Status\",\n          \"type\": \"stat\",\n          \"targets\": [\n            {\n              \"expr\": \"kube_pod_status_phase{pod=~\\\"grafana.*|home-assistant.*|jellyfin.*\\\", phase=\\\"Running\\\"}\",\n              \"legendFormat\": \"{{pod}}\",\n              \"refId\": \"A\"\n            }\n          ],\n          \"fieldConfig\": {\n            \"defaults\": {\n              \"color\": {\n                \"mode\": \"thresholds\"\n              },\n              \"thresholds\": {\n                \"steps\": [\n                  {\"color\": \"red\", \"value\": 0},\n                  {\"color\": \"green\", \"value\": 1}\n                ]\n              },\n              \"mappings\": [\n                {\"options\": {\"0\": {\"text\": \"DOWN\"}}, \"type\": \"value\"},\n                {\"options\": {\"1\": {\"text\": \"RUNNING\"}}, \"type\": \"value\"}\n              ]\n            }\n          },\n          \"gridPos\": {\"h\": 4, \"w\": 12, \"x\": 12, \"y\": 0}\n        },\n        {\n          \"id\": 3,\n          \"title\": \"Node Disk Usage %\",\n          \"type\": \"timeseries\",\n          \"targets\": [\n            {\n              \"expr\": \"(1 - (node_filesystem_avail_bytes{fstype!=\\\"tmpfs\\\",mountpoint=\\\"/\\\"} / node_filesystem_size_bytes{fstype!=\\\"tmpfs\\\",mountpoint=\\\"/\\\"})) * 100\",\n              \"legendFormat\": \"{{instance}} - Root FS\",\n              \"refId\": \"A\"\n            }\n          ],\n          \"fieldConfig\": {\n            \"defaults\": {\n              \"color\": {\n                \"mode\": \"palette-classic\"\n              },\n              \"custom\": {\n                \"drawStyle\": \"line\",\n                \"lineInterpolation\": \"linear\",\n                \"lineWidth\": 2,\n                \"fillOpacity\": 10\n              },\n              \"unit\": \"percent\",\n              \"min\": 0,\n              \"max\": 100,\n              \"thresholds\": {\n                \"steps\": [\n                  {\"color\": \"green\", \"value\": null},\n                  {\"color\": \"yellow\", \"value\": 80},\n                  {\"color\": \"red\", \"value\": 90}\n                ]\n              }\n            }\n          },\n          \"gridPos\": {\"h\": 8, \"w\": 24, \"x\": 0, \"y\": 4}\n        },\n        {\n          \"id\": 4,\n          \"title\": \"Pod Restart Count (Last 5 minutes)\",\n          \"type\": \"stat\",\n          \"targets\": [\n            {\n              \"expr\": \"increase(kube_pod_container_status_restarts_total{container=~\\\"grafana|home-assistant|jellyfin\\\"}[5m])\",\n              \"legendFormat\": \"{{container}}\",\n              \"refId\": \"A\"\n            }\n          ],\n          \"fieldConfig\": {\n            \"defaults\": {\n              \"color\": {\n                \"mode\": \"thresholds\"\n              },\n              \"thresholds\": {\n                \"steps\": [\n                  {\"color\": \"green\", \"value\": 0},\n                  {\"color\": \"yellow\", \"value\": 1},\n                  {\"color\": \"red\", \"value\": 3}\n                ]\n              }\n            }\n          },\n          \"gridPos\": {\"h\": 4, \"w\": 12, \"x\": 0, \"y\": 12}\n        },\n        {\n          \"id\": 5,\n          \"title\": \"Deployment Ready Status\",\n          \"type\": \"stat\",\n          \"targets\": [\n            {\n              \"expr\": \"kube_deployment_status_replicas_available{deployment=~\\\"grafana|home-assistant|jellyfin\\\"}\",\n              \"legendFormat\": \"{{deployment}}\",\n              \"refId\": \"A\"\n            }\n          ],\n          \"fieldConfig\": {\n            \"defaults\": {\n              \"color\": {\n                \"mode\": \"thresholds\"\n              },\n              \"thresholds\": {\n                \"steps\": [\n                  {\"color\": \"red\", \"value\": 0},\n                  {\"color\": \"green\", \"value\": 1}\n                ]\n              },\n              \"mappings\": [\n                {\"options\": {\"0\": {\"text\": \"NOT READY\"}}, \"type\": \"value\"},\n                {\"options\": {\"1\": {\"text\": \"READY\"}}, \"type\": \"value\"}\n              ]\n            }\n          },\n          \"gridPos\": {\"h\": 4, \"w\": 12, \"x\": 12, \"y\": 12}\n        },\n        {\n          \"id\": 6,\n          \"title\": \"Application Pod Status Over Time\",\n          \"type\": \"timeseries\",\n          \"targets\": [\n            {\n              \"expr\": \"kube_pod_status_phase{pod=~\\\"grafana.*|home-assistant.*|jellyfin.*\\\", phase=\\\"Running\\\"}\",\n              \"legendFormat\": \"{{pod}} - Running\",\n              \"refId\": \"A\"\n            },\n            {\n              \"expr\": \"kube_pod_status_phase{pod=~\\\"grafana.*|home-assistant.*|jellyfin.*\\\", phase=\\\"Pending\\\"}\",\n              \"legendFormat\": \"{{pod}} - Pending\",\n              \"refId\": \"B\"\n            },\n            {\n              \"expr\": \"kube_pod_status_phase{pod=~\\\"grafana.*|home-assistant.*|jellyfin.*\\\", phase=\\\"Failed\\\"}\",\n              \"legendFormat\": \"{{pod}} - Failed\",\n              \"refId\": \"C\"\n            }\n          ],\n          \"fieldConfig\": {\n            \"defaults\": {\n              \"color\": {\n                \"mode\": \"palette-classic\"\n              },\n              \"custom\": {\n                \"drawStyle\": \"line\",\n                \"lineInterpolation\": \"stepAfter\",\n                \"lineWidth\": 2,\n                \"fillOpacity\": 20,\n                \"stacking\": {\n                  \"mode\": \"normal\"\n                }\n              },\n              \"min\": 0,\n              \"max\": 1\n            }\n          },\n          \"gridPos\": {\"h\": 8, \"w\": 24, \"x\": 0, \"y\": 16}\n        }\n      ]\n    }\n---\n# Grafana Configuration Script ConfigMap\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: grafana-config-script\n  namespace: default\ndata:\n  configure-default-dashboard.sh: |\n    #!/bin/sh\n    set -e\n    \n    echo \"Waiting for Grafana to be ready...\"\n    until curl -f http://localhost:3000/api/health 2>/dev/null; do\n      echo \"Grafana not ready yet, waiting 5 seconds...\"\n      sleep 5\n    done\n    \n    echo \"Grafana is ready! Getting dashboard ID from UID...\"\n      \n    # We can always just hardcode this since it's the only dashboard\n    echo \"Setting dashboard as organization default...\"\n    JSON_PAYLOAD=\"{\\\"homeDashboardId\\\": 1}\"\n    echo \"JSON payload: $JSON_PAYLOAD\"\n      \n    RESPONSE=$(curl -s -w \"\\n%{http_code}\" \\\n      -u \"admin:${GF_SECURITY_ADMIN_PASSWORD}\" \\\n      -H \"Content-Type: application/json\" \\\n      -d \"$JSON_PAYLOAD\" \\\n      -X PUT \\\n      \"http://localhost:3000/api/org/preferences\")\n      \n    # Split response and HTTP code properly\n    HTTP_CODE=$(echo \"$RESPONSE\" | tail -n1)\n    RESPONSE_BODY=$(echo \"$RESPONSE\" | head -n -1)\n      \n    echo \"HTTP Code: $HTTP_CODE\"\n    echo \"Response Body: $RESPONSE_BODY\"\n      \n    if [ \"$HTTP_CODE\" = \"200\" ]; then\n      echo \"Successfully set default dashboard!\"\n      echo \"Configuration complete. Sidecar will now sleep...\"\n      # Keep the sidecar running but idle\n      while true; do sleep 3600; done\n    else\n      echo \"Failed to set default dashboard. HTTP code: $HTTP_CODE\"\n      echo \"Full response: $RESPONSE\"\n      exit 1\n    fi\n---\n# Grafana PVC\napiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: grafana-data\n  namespace: default\nspec:\n  accessModes:\n    - ReadWriteOnce\n  resources:\n    requests:\n      storage: 2Gi\n  storageClassName: local-path\n---\n# Grafana Deployment\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: grafana\n  namespace: default\nspec:\n  replicas: 1\n  selector:\n    matchLabels:\n      app: grafana\n  template:\n    metadata:\n      labels:\n        app: grafana\n    spec:\n      nodeSelector:\n        kubernetes.io/hostname: node-01\n      securityContext:\n        fsGroup: 472\n      containers:\n      - name: grafana\n        image: grafana/grafana:latest\n        ports:\n        - containerPort: 3000\n        env:\n        - name: GF_SECURITY_ADMIN_USER\n          value: \"admin\"\n        - name: GF_SECURITY_ADMIN_PASSWORD\n          value: \"admin123\"\n        - name: GF_USERS_ALLOW_SIGN_UP\n          value: \"false\"\n        securityContext:\n          runAsUser: 472\n          runAsGroup: 472\n        volumeMounts:\n        - name: grafana-data\n          mountPath: /var/lib/grafana\n        - name: grafana-datasources\n          mountPath: /etc/grafana/provisioning/datasources\n        - name: grafana-dashboards-config\n          mountPath: /etc/grafana/provisioning/dashboards\n        - name: grafana-dashboard-homelab\n          mountPath: /var/lib/grafana/dashboards\n        resources:\n          requests:\n            memory: \"256Mi\"\n            cpu: \"100m\"\n          limits:\n            memory: \"512Mi\"\n            cpu: \"200m\"\n        readinessProbe:\n          httpGet:\n            path: /api/health\n            port: 3000\n          initialDelaySeconds: 30\n          periodSeconds: 10\n          timeoutSeconds: 5\n        livenessProbe:\n          httpGet:\n            path: /api/health\n            port: 3000\n          initialDelaySeconds: 60\n          periodSeconds: 30\n          timeoutSeconds: 10\n      - name: configure-default-dashboard\n        image: curlimages/curl:latest\n        command: [\"/bin/sh\", \"/scripts/configure-default-dashboard.sh\"]\n        env:\n        - name: GF_SECURITY_ADMIN_PASSWORD\n          value: \"admin123\"\n        - name: DEFAULT_DASHBOARD_UID\n          value: \"remotelab-main\"\n        volumeMounts:\n        - name: grafana-config-script\n          mountPath: /scripts\n        resources:\n          requests:\n            memory: \"32Mi\"\n            cpu: \"10m\"\n          limits:\n            memory: \"64Mi\"\n            cpu: \"50m\"\n      volumes:\n      - name: grafana-data\n        persistentVolumeClaim:\n          claimName: grafana-data\n      - name: grafana-datasources\n        configMap:\n          name: grafana-datasources\n      - name: grafana-dashboards-config\n        configMap:\n          name: grafana-dashboards-config\n      - name: grafana-dashboard-homelab\n        configMap:\n          name: grafana-dashboard-homelab\n      - name: grafana-config-script\n        configMap:\n          name: grafana-config-script\n          defaultMode: 0755\n\n---\n# Grafana Service\napiVersion: v1\nkind: Service\nmetadata:\n  name: grafana-service\n  namespace: default\nspec:\n  selector:\n    app: grafana\n  ports:\n  - port: 3000\n    targetPort: 3000\n    nodePort: 30300\n  type: NodePort\nEOF\n\nkubectl apply -f remotelab_deployment.yaml"
+        init_dev_machine_setup_tailscale:
+            name: init_dev_machine_setup_tailscale
+            machine: dev-machine
+            init: true
+            user: root
+            timeout_seconds: 300
+            run: |-
+                #!/bin/bash
+
+                curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+                curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+
+                apt-get update
+                apt-get install -y tailscale
+
+                systemctl start tailscaled
+        init_node_01_setup_tailscale:
+            name: init_node_01_setup_tailscale
+            machine: node-01
+            init: true
+            user: root
+            timeout_seconds: 300
+            run: |-
+                #!/bin/bash
+
+                curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+                curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+
+                apt-get update
+                apt-get install -y tailscale
+
+                systemctl start tailscaled
+        init_node_02_configure_ssh_access:
+            name: init_node_02_configure_ssh_access
+            machine: node-02
+            init: true
+            user: root
+            timeout_seconds: 300
+            run: "#!/bin/bash\n\n# Check if phoneuser already exists\nif id \"phoneuser\" &>/dev/null; then\n    echo \"User 'phoneuser' already exists. Skipping user creation.\"\nelse\n    echo \"Creating user 'phoneuser'...\"\n    useradd -m -s /bin/bash phoneuser\n    \n    # Add to sudo group if you want admin access (optional)\n    usermod -aG sudo phoneuser\n    echo \"User 'phoneuser' created successfully.\"\nfi\n\n# Ensure .ssh directory exists\nmkdir -p /home/phoneuser/.ssh\n\n# Set up SSH key\necho \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMbXUaRWWzIgKXP/asJxzJLuk4pYIvxm1Pl4mWyBN3Ru\" | tee /home/phoneuser/.ssh/authorized_keys\nchown phoneuser:phoneuser /home/phoneuser/.ssh/authorized_keys\nchmod 600 /home/phoneuser/.ssh/authorized_keys\n\n# Allow phoneuser to run sudo commands without a password\nSUDOERS_FILE=\"/etc/sudoers.d/99-phoneuser-nopasswd\"\nif [ ! -f \"$SUDOERS_FILE\" ]; then\n    echo \"Granting passwordless sudo to 'phoneuser'...\"\n    echo \"phoneuser ALL=(ALL) NOPASSWD:ALL\" | sudo tee \"$SUDOERS_FILE\" > /dev/null\n    chmod 440 \"$SUDOERS_FILE\"  # Restrict permissions for security\nelse\n    echo \"Passwordless sudo already configured for 'phoneuser'.\"\nfi\n\necho \"Script completed successfully.\"\n"
+        init_node_02_copy_jellyfin_config:
+            name: init_node_02_copy_jellyfin_config
+            machine: node-02
+            init: true
+            user: root
+            timeout_seconds: 300
+            run: |-
+                #!/bin/bash
+
+                wget --no-cache https://labs.iximiuz.com/content/files/playgrounds/my-k3s-89c9799c/__static__/jellyfin-config.tar.gz?t=$(date +%s) -O jellyfin-config.tar.gz
+
+                mkdir -p /jellyfin-config
+                tar -xzf jellyfin-config.tar.gz -C /jellyfin-config
+                rm jellyfin-config.tar.gz
+
+                chown -R 1000:1000 /jellyfin-config
+                chmod -R 755 /jellyfin-config
+        init_node_02_download_cats:
+            name: init_node_02_download_cats
+            machine: node-02
+            init: true
+            user: root
+            timeout_seconds: 300
+            run: |-
+                #!/bin/bash
+
+                wget --no-cache https://labs.iximiuz.com/content/files/playgrounds/my-k3s-89c9799c/__static__/cats.tar.gz?t=$(date +%s) -O cats.tar.gz
+
+                mkdir -p /cats
+                tar -xzf cats.tar.gz -C /cats
+                rm cats.tar.gz
+
+                chown -R 1000:1000 /cats
+                chmod -R 755 /cats
+        init_node_02_give_user_dir_permissions:
+            name: init_node_02_give_user_dir_permissions
+            machine: node-02
+            init: true
+            user: root
+            timeout_seconds: 300
+            run: |-
+                #!/bin/bash
+
+                mkdir -p /var/log/fake_logs
+                chown -R laborant:laborant /var/log/fake_logs
+        init_node_02_setup_tailscale:
+            name: init_node_02_setup_tailscale
+            machine: node-02
+            init: true
+            user: root
+            timeout_seconds: 300
+            run: |-
+                #!/bin/bash
+
+                curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+                curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+
+                apt-get update
+                apt-get install -y tailscale
+
+                systemctl start tailscaled
+    accessControl:
+        canList:
+            - anyone
+        canRead:
+            - anyone
+        canStart:
+            - anyone
